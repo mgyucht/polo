@@ -5,10 +5,77 @@ from autobahn.websocket.util import parse_url as parse_ws_url
 from autobahn.websocket.compress import PerMessageDeflateOffer, \
     PerMessageDeflateResponse, PerMessageDeflateResponseAccept
 
+from sqlite_dbi import SqliteDbi
+
 import asyncio
 import txaio
 txaio.use_asyncio()  # noqa
 import signal
+import sys
+
+# The amount for a certain rate on the exchange has changed
+ORDER_BOOK_MODIFY = 'orderBookModify'
+# There is no more order for the specified rate
+ORDER_BOOK_REMOVE = 'orderBookRemove'
+# A trade has executed on the exchange
+NEW_TRADE = 'newTrade'
+
+def getOnExchangeHandler(exchange, dbi):
+    """Returns a handler which logs events on the given exchange and writes them to the database."""
+    def onExchange(*events, seq):
+        log_message_arr = []
+        log_message_base = "[Exchange: {}, seq: {}] ".format(exchange, seq)
+
+        for event in events:
+            event_type = event['type']
+            data = event['data']
+            if event_type == ORDER_BOOK_MODIFY:
+                log_message_arr.append(log_message_base + "{type} at rate {rate} now at amount "
+                                       "{amount}".format(**data))
+                dbi.record_order_modified(seq, exchange, event_type, data['rate'], data['amount'])
+            elif event_type == ORDER_BOOK_REMOVE:
+                log_message_arr.append(log_message_base + "{type} at rate {rate} has been "
+                                       "withdrawn".format(**data))
+                dbi.record_order_removed(seq, exchange, event_type, data['rate'])
+            elif event_type == NEW_TRADE:
+                log_message_arr.append(log_message_base + "{type} trade completed at rate {rate} "
+                                       "for amount {amount} (date: {date}, total: {total}, trade "
+                                       "ID: {tradeID})".format(**data))
+                dbi.record_new_trade(seq, exchange, event_type, data['rate'], data['amount'],
+                                     data['date'], data['total'], data['tradeID'])
+            else:
+                log_message_arr.append(log_message_base + "Unexpected type {}".format(event_type))
+        print("\n".join(log_message_arr))
+    return onExchange
+
+def getOnTickerHandler(dbi):
+    """Returns a handler which logs ticker events and writes them to the provided database."""
+    def onTicker(currencyPair, last, lowestAsk, highestBid, percentChange, baseVolume, quoteVolume, isFrozen, lastDayHigh, lastDayLow):
+        log_message = """Ticker event received for currency pair {currencyPair}:
+- Last:           {last}
+- Lowest ask:     {lowestAsk}
+- Highest bid:    {highestBid}
+- Percent change: {percentChange}
+- Base volume:    {baseVolume}
+- Quote volume:   {quoteVolume}
+- Is Frozen?      {isFrozen}
+- 24 hour high:   {lastDayHigh}
+- 24 hour low:    {lastDayLow}""".format(
+            currencyPair = currencyPair,
+            last = last,
+            lowestAsk = lowestAsk,
+            highestBid = highestBid,
+            percentChange = percentChange,
+            baseVolume = baseVolume,
+            quoteVolume = quoteVolume,
+            isFrozen = isFrozen,
+            lastDayHigh = lastDayHigh,
+            lastDayLow = lastDayLow,
+        )
+        print(log_message)
+        dbi.record_ticker_change(currencyPair, last, lowestAsk, highestBid, percentChange,
+                                 baseVolume, quoteVolume, isFrozen, lastDayHigh, lastDayLow)
+    return onTicker
 
 
 class PoloniexComponent(ApplicationSession):
@@ -17,14 +84,17 @@ class PoloniexComponent(ApplicationSession):
         self.join(self.config.realm)
 
     @asyncio.coroutine
-    def onJoin(self, details):
-        def onTicker(*args):
-            print("Ticker event received:", args)
-
+    def __trySubscribe(self, func, channel):
         try:
-            yield from self.subscribe(onTicker, 'ticker')
+            yield from self.subscribe(func, channel)
         except Exception as e:
-            print("Could not subscribe to topic:", e)
+            print("Could not subscribe to topic {}".format(channel), e)
+
+    @asyncio.coroutine
+    def onJoin(self, details):
+        dbi = SqliteDbi()
+        yield from self.__trySubscribe(getOnTickerHandler(dbi), 'ticker')
+        yield from self.__trySubscribe(getOnExchangeHandler('BTC_ETH', dbi), 'BTC_ETH')
 
 
 def main():
